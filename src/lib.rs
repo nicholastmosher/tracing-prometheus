@@ -1,7 +1,17 @@
-use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
+#![warn(clippy::panic)]
+#![warn(clippy::unwrap_used)]
+#![warn(clippy::expect_used)]
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use prometheus_client::{
-    metrics::{counter::Counter, family::Family, gauge::Gauge, histogram::Histogram, MetricType},
+    metrics::{
+        counter::Counter, family::Family, gauge::Gauge, histogram::Histogram, info::Info,
+        MetricType,
+    },
     registry::Registry,
 };
 use tracing::{field::Visit, Subscriber};
@@ -14,6 +24,8 @@ pub struct MetricsLayer {
 
 impl MetricsLayer {
     pub fn render(&self) -> Result<String, std::fmt::Error> {
+        // SAFETY: RwLock should not be poisoned, if so it's a bug
+        #[allow(clippy::expect_used)]
         let state = self.state.read().expect("read metrics state");
         let mut rendered = String::new();
         prometheus_client::encoding::text::encode(&mut rendered, &state.registry)?;
@@ -34,68 +46,15 @@ pub struct MetricsLayerState {
 
     /// Handles to histograms
     histograms: BTreeMap<&'static str, Family<MetricLabels, Histogram>>,
-}
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct Descriptor {
-    name: Cow<'static, str>,
-    help: Cow<'static, str>,
+    /// Set of infos that have been registered
+    infos: BTreeSet<&'static str>,
 }
 
 impl<S> tracing_subscriber::Layer<S> for MetricsLayer
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    fn register_callsite(
-        &self,
-        metadata: &'static tracing::Metadata<'static>,
-    ) -> tracing::subscriber::Interest {
-        let is_metric = metadata
-            .fields()
-            .iter()
-            .any(|field| field.name().starts_with("metrics."));
-        if !is_metric {
-            return tracing::subscriber::Interest::never();
-        }
-
-        // All fields beginning with `.metrics.<kind>`, sorted by kind
-        let metric_fields_by_kind = metadata
-            .fields()
-            .iter()
-            .filter_map(|field| field.name().strip_prefix("metrics."))
-            .filter_map(|metric| metric.split_once('.'))
-            .filter_map(|(kind, name_etc)| parse_metric_type(kind).map(|kind| (kind, name_etc)))
-            .collect::<Vec<_>>();
-
-        // Names of all counters, gauges, and histograms
-        let (counters, gauges, histograms) = metric_fields_by_kind
-            .iter()
-            .filter(|(_kind, name_etc)| !name_etc.contains('.'))
-            .fold(
-                Default::default(),
-                |acc: (Vec<_>, Vec<_>, Vec<_>), (kind, name)| {
-                    let (mut counters, mut gauges, mut histograms) = acc;
-                    match kind {
-                        MetricType::Counter => counters.push(name),
-                        MetricType::Gauge => gauges.push(name),
-                        MetricType::Histogram => histograms.push(name),
-                        _ => {}
-                    }
-                    (counters, gauges, histograms)
-                },
-            );
-
-        tracing::subscriber::Interest::always()
-    }
-
-    fn on_record(
-        &self,
-        _span: &tracing::span::Id,
-        _values: &tracing::span::Record<'_>,
-        _ctx: tracing_subscriber::layer::Context<'_, S>,
-    ) {
-    }
-
     fn on_event(
         &self,
         event: &tracing::Event<'_>,
@@ -103,109 +62,125 @@ where
     ) {
         let mut visitor = MetricEventVisitor::new();
         event.record(&mut visitor);
-        // println!("{visitor:#?}");
+        let Ok(samples) = visitor.into_samples() else {
+            tracing::warn!("Error converting samples");
+            return;
+        };
 
         let new_metrics = {
+            // SAFETY: No panic possible during any write guard, should not be poisoned
+            #[allow(clippy::expect_used)]
             let state = self.state.read().expect("read metrics state");
-            visitor
-                .samples
+            samples
                 .iter()
-                .filter(|(name, _event)| {
-                    if state.counters.contains_key(*name) {
-                        return false;
+                .filter(|sample| match sample {
+                    MetricSample::Counter { meta, .. } => !state.counters.contains_key(meta.name),
+                    MetricSample::Gauge { meta, .. } => !state.gauges.contains_key(meta.name),
+                    MetricSample::Histogram { meta, .. } => {
+                        !state.histograms.contains_key(meta.name)
                     }
-                    if state.gauges.contains_key(*name) {
-                        return false;
-                    }
-                    if state.histograms.contains_key(*name) {
-                        return false;
-                    }
-                    true
+                    MetricSample::Info { meta } => !state.infos.contains(meta.name),
                 })
                 .collect::<Vec<_>>()
         };
 
         // New metrics need to be registered
         if !new_metrics.is_empty() {
-            for (name, event) in new_metrics {
-                let help = event
-                    .help
-                    .clone()
-                    .unwrap_or_else(|| format!("Add help with 'metrics.<type>.{name}.help"));
-                match event.kind {
-                    MetricType::Counter => {
+            for sample in new_metrics {
+                match sample {
+                    MetricSample::Counter { meta, .. } => {
                         let metric = Family::<MetricLabels, Counter>::default();
+                        // SAFETY: No panic possible during any write guard, should not be poisoned
+                        #[allow(clippy::expect_used)]
                         let mut state = self.state.write().expect("write metrics state");
-                        state.registry.register(*name, help, metric.clone());
-                        state.counters.insert(name, metric);
+                        state
+                            .registry
+                            .register(meta.name, &meta.help, metric.clone());
+                        state.counters.insert(meta.name, metric);
                     }
-                    MetricType::Gauge => {
+                    MetricSample::Gauge { meta, .. } => {
                         let metric = Family::<MetricLabels, Gauge>::default();
+                        // SAFETY: No panic possible during any write guard, should not be poisoned
+                        #[allow(clippy::expect_used)]
                         let mut state = self.state.write().expect("write metrics state");
-                        state.registry.register(*name, help, metric.clone());
-                        state.gauges.insert(name, metric);
+                        state
+                            .registry
+                            .register(meta.name, &meta.help, metric.clone());
+                        state.gauges.insert(meta.name, metric);
                     }
-                    MetricType::Histogram => {
+                    MetricSample::Histogram { meta, .. } => {
                         let metric =
                             Family::<MetricLabels, Histogram>::new_with_constructor(|| {
                                 // TODO(nick): Figure out how to configure this
                                 Histogram::new([0.1_f64].into_iter())
                             });
+                        // SAFETY: No panic possible during any write guard, should not be poisoned
+                        #[allow(clippy::expect_used)]
                         let mut state = self.state.write().expect("write metrics state");
-                        state.registry.register(*name, help, metric.clone());
-                        state.histograms.insert(name, metric);
+                        state
+                            .registry
+                            .register(meta.name, &meta.help, metric.clone());
+                        state.histograms.insert(meta.name, metric);
                     }
-                    unsupported => {
-                        tracing::warn!("Ignoring unsupported metric type {unsupported:?}");
+                    MetricSample::Info { meta } => {
+                        let metric = Info::new(meta.labels.clone());
+                        // SAFETY: No panic possible during any write guard, should not be poisoned
+                        #[allow(clippy::expect_used)]
+                        let mut state = self.state.write().expect("write metrics state");
+                        state.registry.register(meta.name, &meta.help, metric);
+                        state.infos.insert(meta.name);
                     }
                 }
             }
         }
 
         // Record actual values
-        for (name, event) in visitor.samples {
-            match event.kind {
-                MetricType::Counter => {
-                    // TODO(nick): Make this infallible
-                    let Some(MetricValue::Counter(value)) = event.value else {
-                        panic!("expected counter")
-                    };
+        for sample in samples {
+            match sample {
+                MetricSample::Counter { meta, value } => {
+                    // SAFETY: No panic possible during any write guard, should not be poisoned
+                    #[allow(clippy::expect_used)]
                     let state = self.state.read().expect("read metrics state");
+
+                    // SAFETY: We just checked that each sample either existed or was created
+                    #[allow(clippy::expect_used)]
                     state
                         .counters
-                        .get(name)
+                        .get(meta.name)
                         .expect("should have counter")
-                        .get_or_create(&event.labels)
-                        .inc_by(value); // TODO(nick): Use real value
+                        .get_or_create(&meta.labels)
+                        .inc_by(value);
                 }
-                MetricType::Gauge => {
-                    // TODO(nick): Make this infallible
-                    let Some(MetricValue::Gauge(value)) = event.value else {
-                        panic!("expected gauge")
-                    };
+                MetricSample::Gauge { meta, value } => {
+                    // SAFETY: No panic possible during any write guard, should not be poisoned
+                    #[allow(clippy::expect_used)]
                     let state = self.state.read().expect("read metrics state");
+
+                    // SAFETY: We just checked that each sample either existed or was created
+                    #[allow(clippy::expect_used)]
                     state
                         .gauges
-                        .get(name)
+                        .get(meta.name)
                         .expect("should have gauge")
-                        .get_or_create(&event.labels)
-                        .set(value); // TODO(nick): Use real value
+                        .get_or_create(&meta.labels)
+                        .set(value);
                 }
-                MetricType::Histogram => {
-                    // TODO(nick): Make this infallible
-                    let Some(MetricValue::Histogram(value)) = event.value else {
-                        panic!("expected histogram value")
-                    };
+                MetricSample::Histogram { meta, value } => {
+                    // SAFETY: No panic possible during any write guard, should not be poisoned
+                    #[allow(clippy::expect_used)]
                     let state = self.state.read().expect("read metrics state");
+
+                    // SAFETY: We just checked that each sample either existed or was created
+                    #[allow(clippy::expect_used)]
                     state
                         .histograms
-                        .get(name)
+                        .get(meta.name)
                         .expect("should have histogram")
-                        .get_or_create(&event.labels)
+                        .get_or_create(&meta.labels)
                         .observe(value);
                 }
-                unsupported => {
-                    tracing::warn!("")
+                MetricSample::Info { .. } => {
+                    // Info only needs registered, it does not record values
                 }
             }
         }
@@ -217,31 +192,46 @@ fn parse_metric_type(s: &str) -> Option<MetricType> {
         "counter" => MetricType::Counter,
         "gauge" => MetricType::Gauge,
         "histogram" => MetricType::Histogram,
+        "info" => MetricType::Info,
         _ => return None,
     };
     Some(kind)
 }
 
-type MetricLabels = Vec<(&'static str, String)>;
-
 #[derive(Debug)]
-enum MetricValue {
-    Counter(u64),
-    Gauge(i64),
-    Histogram(f64),
+struct MetricMeta {
+    name: &'static str,
+    help: String,
+    labels: MetricLabels,
 }
 
 #[derive(Debug)]
-struct MetricEvent {
+enum MetricSample {
+    Counter { meta: MetricMeta, value: u64 },
+    Gauge { meta: MetricMeta, value: i64 },
+    Histogram { meta: MetricMeta, value: f64 },
+    Info { meta: MetricMeta },
+}
+
+#[derive(Debug)]
+struct MetricEventBuilder {
     kind: MetricType,
-    // TODO(nick): Support f64 or u64
     value: Option<MetricValue>,
     help: Option<String>,
     labels: MetricLabels,
 }
 
-impl MetricEvent {
-    pub fn new(kind: MetricType) -> Self {
+#[derive(Debug)]
+enum MetricValue {
+    U64(u64),
+    I64(i64),
+    F64(f64),
+}
+
+type MetricLabels = Vec<(&'static str, String)>;
+
+impl MetricEventBuilder {
+    fn new(kind: MetricType) -> Self {
         Self {
             kind,
             value: None,
@@ -250,29 +240,77 @@ impl MetricEvent {
         }
     }
 
-    pub fn set_value(&mut self, value: MetricValue) {
+    fn set_value(&mut self, value: MetricValue) {
         self.value = Some(value);
     }
 
-    pub fn set_help(&mut self, help: &str) {
+    fn set_help(&mut self, help: &str) {
         self.help = Some(help.to_string());
     }
 
-    pub fn set_label(&mut self, name: &'static str, value: &str) {
+    fn set_label(&mut self, name: &'static str, value: &str) {
         self.labels.push((name, value.to_string()));
+    }
+
+    // TODO(nick): Better errors
+    fn into_sample(self, name: &'static str) -> Result<MetricSample, ()> {
+        let help = self
+            .help
+            .unwrap_or_else(|| format!("Add help with 'metrics.<type>.{name}.help'"));
+        let meta = MetricMeta {
+            name,
+            help,
+            labels: self.labels,
+        };
+        let sample = match self.kind {
+            MetricType::Counter => {
+                let value = match self.value {
+                    Some(MetricValue::U64(value)) => value,
+                    Some(MetricValue::I64(value)) => u64::try_from(value).map_err(|_| ())?,
+                    _ => return Err(()),
+                };
+                MetricSample::Counter { meta, value }
+            }
+            MetricType::Gauge => {
+                let value = match self.value {
+                    Some(MetricValue::U64(value)) => i64::try_from(value).map_err(|_| ())?,
+                    Some(MetricValue::I64(value)) => value,
+                    _ => return Err(()),
+                };
+                MetricSample::Gauge { meta, value }
+            }
+            MetricType::Histogram => {
+                let value = match self.value {
+                    Some(MetricValue::F64(value)) => value,
+                    _ => return Err(()),
+                };
+                MetricSample::Histogram { meta, value }
+            }
+            MetricType::Info => MetricSample::Info { meta },
+            _ => return Err(()),
+        };
+        Ok(sample)
     }
 }
 
 #[derive(Debug)]
 struct MetricEventVisitor {
-    samples: BTreeMap<&'static str, MetricEvent>,
+    builders: BTreeMap<&'static str, MetricEventBuilder>,
 }
 
 impl MetricEventVisitor {
     pub fn new() -> Self {
         Self {
-            samples: Default::default(),
+            builders: Default::default(),
         }
+    }
+
+    // TODO(nick): Better error
+    fn into_samples(self) -> Result<Vec<MetricSample>, ()> {
+        self.builders
+            .into_iter()
+            .map(|(name, builder)| (builder.into_sample(name)))
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 
@@ -317,26 +355,26 @@ impl MetricEventVisitor {
             return;
         }
 
-        let sample = self
-            .samples
+        let builder = self
+            .builders
             .entry(name)
-            .or_insert_with(|| MetricEvent::new(kind));
+            .or_insert_with(|| MetricEventBuilder::new(kind));
 
         // Ensure samples to the same metric are written as the same type
         //
         // - metrics.counter.request_count = 1 // Ok
         // - metrics.histogram.request_count = 1 // Bad, request_count was set as counter
-        if sample.kind.as_str() != kind.as_str() {
+        if builder.kind.as_str() != kind.as_str() {
             tracing::warn!(
                 "Metric {} is a {}, received {} sample - ignoring",
                 name,
-                sample.kind.as_str(),
+                builder.kind.as_str(),
                 kind.as_str()
             );
             return;
         }
 
-        sample.set_value(value);
+        builder.set_value(value);
     }
 }
 
@@ -344,15 +382,15 @@ impl Visit for MetricEventVisitor {
     fn record_debug(&mut self, _field: &tracing::field::Field, _value: &dyn std::fmt::Debug) {}
 
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        self.record_metric(field, MetricValue::Counter(value));
+        self.record_metric(field, MetricValue::U64(value));
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-        self.record_metric(field, MetricValue::Gauge(value));
+        self.record_metric(field, MetricValue::I64(value));
     }
 
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-        self.record_metric(field, MetricValue::Histogram(value));
+        self.record_metric(field, MetricValue::F64(value));
     }
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
@@ -390,42 +428,42 @@ impl Visit for MetricEventVisitor {
         // - metrics.counter.request_count.label.method = "GET" // Good
         // - metrics.counter.request_count = 1 // Ignored
         let Some((name, rest)) = name_etc.split_once('.') else {
-            tracing::warn!("Found string, expected f64 for value {}", field.name());
+            tracing::warn!("Found string, expected number for value {}", field.name());
             return;
         };
 
-        let sample = self
-            .samples
+        let builder = self
+            .builders
             .entry(name)
-            .or_insert_with(|| MetricEvent::new(kind));
+            .or_insert_with(|| MetricEventBuilder::new(kind));
 
         // Ensure samples to the same metric are written as the same type
         //
         // - metrics.counter.request_count.help = "Here you go" // Ok
         // - metrics.histogram.request_count.help = "Here you go" // Bad, request_count was set as counter
-        if sample.kind.as_str() != kind.as_str() {
+        if builder.kind.as_str() != kind.as_str() {
             tracing::warn!(
                 "Metric {} is a {}, received {} sample - ignoring",
                 name,
-                sample.kind.as_str(),
+                builder.kind.as_str(),
                 kind.as_str()
             );
             return;
         }
 
         if rest == "help" {
-            sample.set_help(value);
+            builder.set_help(value);
             return;
         }
 
         if let Some(label_name) = rest.strip_prefix("label.") {
-            sample.set_label(label_name, value);
-            return;
+            builder.set_label(label_name, value);
         }
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use tracing_subscriber::prelude::*;
 
@@ -458,6 +496,13 @@ mod tests {
             metrics.counter.consumed_batches.label.app_id = "12345",
             metrics.counter.consumed_batches.label.topic = "transactions",
             metrics.counter.consumed_batches.label.group = "webhook",
+        );
+
+        tracing::trace!(
+            metrics.info.build.help = "This is the number of consumed batches",
+            metrics.info.build.label.app_id = "12345",
+            metrics.info.build.label.topic = "transactions",
+            metrics.info.build.label.group = "webhook",
         );
 
         let rendered = handle.render().unwrap();
