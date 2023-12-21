@@ -1,0 +1,9 @@
+[package]
+name = "tracing-prometheus"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+prometheus-client = "0.22.0"
+tracing = "0.1.40"
+tracing-subscriber = "0.3.18"
