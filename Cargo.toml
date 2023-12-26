@@ -1,7 +1,10 @@
 [package]
 name = "tracing-prometheus"
-version = "0.1.0"
+description = "A tracing layer for capturing prometheus metrics"
+version = "0.0.1"
 edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nicholastmosher/tracing-prometheus"
 
 [dependencies]
 prometheus-client = "0.22.0"
